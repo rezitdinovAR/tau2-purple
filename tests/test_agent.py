@@ -138,7 +138,7 @@ def validate_event(data: dict[str, Any]) -> list[str]:
 # A2A messaging helpers
 
 async def send_text_message(text: str, url: str, context_id: str | None = None, streaming: bool = False):
-    async with httpx.AsyncClient(timeout=10) as httpx_client:
+    async with httpx.AsyncClient(timeout=10, trust_env=False) as httpx_client:
         resolver = A2ACardResolver(httpx_client=httpx_client, base_url=url)
         agent_card = await resolver.get_agent_card()
         config = ClientConfig(httpx_client=httpx_client, streaming=streaming)
@@ -162,7 +162,8 @@ async def send_text_message(text: str, url: str, context_id: str | None = None, 
 
 def test_agent_card(agent):
     """Validate agent card structure and required fields."""
-    response = httpx.get(f"{agent}/.well-known/agent-card.json")
+    with httpx.Client(trust_env=False) as client:
+        response = client.get(f"{agent}/.well-known/agent-card.json")
     assert response.status_code == 200, "Agent card endpoint must return 200"
 
     card_data = response.json()

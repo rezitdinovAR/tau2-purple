@@ -1,45 +1,59 @@
 {
   manifest_version: "0.1.0",
 
-  // TODO: Declare all config your agent needs from the deployer
-  // Use secret: true for sensitive values like API keys
+  // Config supplied by the deployer (AgentBeats UI / Amber scenario).
+  // The agent reads these values from environment variables at runtime.
   config_schema: {
     type: "object",
     properties: {
-      my_api_key: { type: "string", secret: true },
+      openrouter_api_key:    { type: "string", secret: true },
+      agent_llm: {
+        type: "string",
+        description: "litellm model id (e.g. openai/gpt-4.1, anthropic/claude-sonnet-4-5)",
+        default: "openai/gpt-4.1",
+      },
+      agent_temperature: {
+        type: "string",
+        description: "Sampling temperature for the agent LLM",
+        default: "0.0",
+      },
     },
-    required: ["my_api_key"],
+    // Only one provider key is strictly required — leave the other blank if unused.
+    required: [],
     additionalProperties: false,
   },
 
-  // External services this agent uses
+  // External services this agent uses.
   slots: {
     proxy: { kind: "a2a", optional: true },
   },
 
-  // Runtime configuration
+  // Runtime configuration.
   program: {
-    // TODO: Replace with your docker image
+    // TODO: Replace <your-username>/<your-repo-name> with your real GHCR image
+    //       once the GitHub Actions workflow has published it for the first time.
     image: "ghcr.io/<your-username>/<your-repo-name>:latest",
-    entrypoint: "uv run python src/server.py --host 0.0.0.0 --port 9010",
+    entrypoint: "uv run python src/server.py --host 0.0.0.0 --port 9009",
 
-    // TODO: Pass config values as environment variables
+    // Pass config values through to the container as environment variables.
     env: {
-      MY_API_KEY: "${config.my_api_key}",
+      OPENROUTER_API_KEY:       "${config.openrouter_api_key}",
+      TAU2_AGENT_LLM:           "${config.agent_llm}",
+      TAU2_AGENT_TEMPERATURE:   "${config.agent_temperature}",
     },
 
     network: {
       endpoints: [
-        { name: "a2a_endpoint", port: 9010 }, // ensure port matches your entrypoint
+        { name: "a2a_endpoint", port: 9009 }, // must match --port in entrypoint
       ],
     },
   },
 
-  // Capabilities provided by this agent
+  // Capabilities provided by this agent.
   provides: {
     a2a: { kind: "a2a", endpoint: "a2a_endpoint" },
   },
 
-  // Capabilities exposed to the scenario
+  // Capabilities exposed to the scenario.
   exports: { a2a: "a2a" },
 }

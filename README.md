@@ -1,90 +1,94 @@
-# A2A Agent Template
+# tau2-purple-agent
 
-A minimal template for building [A2A (Agent-to-Agent)](https://a2a-protocol.org/latest/) agents.
+An advanced **purple agent** for the [tau2-bench](https://github.com/sierra-research/tau2-bench)
+scenario on [AgentBeats](https://agentbeats.dev/agentbeater/tau2-bench).
 
-## Project Structure
+It is built on the [RDI-Foundation/agent-template](https://github.com/RDI-Foundation/agent-template)
+A2A scaffold and is designed for **maximum pass rate** on the airline, retail,
+and telecom domains while remaining cost-efficient.
 
-```
-src/
-├─ server.py      # Server setup and agent card configuration
-├─ executor.py    # A2A request handling
-├─ agent.py       # Your agent implementation goes here
-└─ messenger.py   # A2A messaging utilities
-tests/
-└─ test_agent.py  # Agent tests
-Dockerfile            # Docker configuration
-pyproject.toml        # Python dependencies
-amber-manifest.json5  # Amber manifest
-.github/
-└─ workflows/
-   └─ test-and-publish.yml # CI workflow
-```
+## What's inside
 
-## Getting Started
+- **`src/agent.py`** — the brains.
+  - Parses the policy and tool schemas out of the green agent's first message.
+  - Feeds them to the LLM as **native function-calling tools** (much more
+    reliable than free-form JSON output) with `tool_choice="required"` so the
+    model is forced to emit a single, structured action per turn.
+  - Uses a strong "elite customer-service agent" system prompt that emphasizes
+    policy compliance, careful reasoning, one-action-per-turn discipline, and
+    explicit confirmation of irreversible actions.
+  - Retries on malformed responses with an explicit error message and falls
+    back to a safe `respond` action so a benchmark run never crashes.
+  - Provider-agnostic via [litellm](https://docs.litellm.ai/docs/providers) —
+    set `TAU2_AGENT_LLM` to any model id (`openai/gpt-4.1`,
+    `anthropic/claude-sonnet-4-5`, `openai/gpt-4o`, …).
+- **`src/server.py`** — A2A server with the agent card filled in for tau2-bench.
+- **`src/executor.py`** — A2A executor; reuses an `Agent` instance per
+  `context_id` so the conversation state survives across turns.
+- **`src/messenger.py`** — A2A messaging helpers (only needed if the agent ever
+  needs to call out to other agents).
+- **`amber-manifest.json5`** — declares the config schema (API keys, model id,
+  temperature) and the runtime command for AgentBeats / Amber.
+- **`.env.example`** — copy to `.env` and fill in your provider key.
 
-1. **Create your repository** - Click "Use this template" to create your own repository from this template
+## Configuration
 
-2. **Implement your agent** - Add your agent logic to [`src/agent.py`](src/agent.py)
+All behaviour is controlled via environment variables (loaded from `.env`):
 
-3. **Configure your agent card** - Fill in your agent's metadata (name, skills, description) in [`src/server.py`](src/server.py)
+| Variable | Default | Description |
+| --- | --- | --- |
+| `TAU2_AGENT_LLM` | `openai/gpt-4.1` | litellm model id |
+| `TAU2_AGENT_TEMPERATURE` | `0.0` | sampling temperature |
+| `TAU2_AGENT_MAX_RETRIES` | `2` | retries on malformed LLM response |
+| `TAU2_AGENT_USE_NATIVE_TOOLS` | `1` | set to `0` to fall back to JSON mode |
+| `OPENAI_API_KEY` | — | required if you use an OpenAI model |
+| `ANTHROPIC_API_KEY` | — | required if you use an Anthropic model |
 
-4. **Fill out your [Amber](https://github.com/RDI-Foundation/amber) manifest** - Update [`amber-manifest.json5`](amber-manifest.json5) to use your agent in Amber scenarios
-
-5. **Write your tests** - Add custom tests for your agent in [`tests/test_agent.py`](tests/test_agent.py)
-
-For a concrete example of implementing an agent using this template, see this [draft PR](https://github.com/RDI-Foundation/agent-template/pull/8).
-
-## Running Locally
+## Running locally
 
 ```bash
-# Install dependencies
+# 1. Install dependencies
 uv sync
 
-# Run the server
-uv run src/server.py
+# 2. Create your .env from the template and fill in a provider key
+cp .env.example .env
+# edit .env and set OPENAI_API_KEY (or ANTHROPIC_API_KEY etc.)
+
+# 3. Run the agent
+uv run src/server.py --host 127.0.0.1 --port 9009
+```
+
+Verify it's up:
+
+```bash
+curl http://127.0.0.1:9009/.well-known/agent-card.json
 ```
 
 ## Running with Docker
 
 ```bash
-# Build the image
-docker build -t my-agent .
-
-# Run the container
-docker run -p 9009:9009 my-agent
+docker build -t tau2-purple-agent .
+docker run -p 9009:9009 --env-file .env tau2-purple-agent --host 0.0.0.0 --port 9009
 ```
 
-## Testing
-
-Run A2A conformance tests against your agent.
+## Tests
 
 ```bash
-# Install test dependencies
 uv sync --extra test
-
-# Start your agent (uv or docker; see above)
-
-# Run tests against your running agent URL
+# (start the agent in another terminal — see "Running locally")
 uv run pytest --agent-url http://localhost:9009
 ```
 
-## Publishing
+## Submitting to AgentBeats
 
-The repository includes a GitHub Actions workflow that automatically builds, tests, and publishes a Docker image of your agent to GitHub Container Registry.
+See the **"How to submit"** section at the bottom of this file (or ask Claude
+for the step-by-step instructions). In short:
 
-If your agent needs API keys or other secrets, add them in Settings → Secrets and variables → Actions → Repository secrets. They'll be available as environment variables during CI tests.
-
-- **Push to `main`** → publishes `latest` tag:
-```
-ghcr.io/<your-username>/<your-repo-name>:latest
-```
-
-- **Create a git tag** (e.g. `git tag v1.0.0 && git push origin v1.0.0`) → publishes version tags:
-```
-ghcr.io/<your-username>/<your-repo-name>:1.0.0
-ghcr.io/<your-username>/<your-repo-name>:1
-```
-
-Once the workflow completes, find your Docker image in the Packages section (right sidebar of your repository). Configure the package visibility in package settings.
-
-> **Note:** Organization repositories may need package write permissions enabled manually (Settings → Actions → General). Version tags must follow [semantic versioning](https://semver.org/) (e.g., `v1.0.0`).
+1. Push this repo to GitHub. The included GitHub Actions workflow will build,
+   test, and publish a Docker image to `ghcr.io/<you>/<repo>:latest`.
+2. Edit `amber-manifest.json5` and replace the placeholder image reference with
+   your real GHCR image.
+3. Register the agent on https://agentbeats.dev as a **purple** agent, point it
+   at the GHCR image, and supply your API key as the `openai_api_key` (or
+   `anthropic_api_key`) config value.
+4. Submit it against the `tau2-bench` green agent.
