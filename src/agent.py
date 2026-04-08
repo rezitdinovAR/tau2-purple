@@ -39,6 +39,7 @@ This implementation:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from typing import Any
@@ -52,6 +53,12 @@ from a2a.utils import get_message_text, new_agent_text_message
 
 
 load_dotenv()
+
+logging.basicConfig(
+    level=os.getenv("TAU2_AGENT_LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("tau2_purple_agent")
 
 
 ADVANCED_SYSTEM_PROMPT = """You are an elite customer-service agent operating under a strict company policy.
@@ -252,15 +259,16 @@ class Agent:
 
     def _get_next_action(self) -> dict[str, Any]:
         last_error: str | None = None
+        use_native = bool(self.tools)
 
-        for _ in range(self.max_retries + 1):
+        for attempt in range(self.max_retries + 1):
             try:
                 kwargs: dict[str, Any] = {
                     "model": self.model,
                     "messages": self.messages,
                     "temperature": self.temperature,
                 }
-                if self.tools:
+                if use_native and self.tools:
                     kwargs["tools"] = self.tools
                     kwargs["tool_choice"] = "required"
                 else:
@@ -280,7 +288,8 @@ class Agent:
                         args = raw_args or {}
                     return {"name": tc.function.name, "arguments": args}
 
-                # 2) JSON-mode path.
+                # 2) JSON-mode path (also used if native tools were requested but
+                #    the model returned plain content instead of a tool_call).
                 content = msg.content or ""
                 content = self._strip_code_fences(content)
                 if not content:
@@ -291,18 +300,41 @@ class Agent:
                 return action
 
             except Exception as exc:  # noqa: BLE001 — we want to retry on any error
-                last_error = str(exc)
+                last_error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "LLM call failed (attempt %d/%d, native_tools=%s): %s",
+                    attempt + 1,
+                    self.max_retries + 1,
+                    use_native,
+                    last_error,
+                )
+                # On first failure with native tools, try JSON mode instead —
+                # some providers / models on OpenRouter don't reliably support
+                # tool_choice="required", and a JSON retry often succeeds.
+                if use_native and attempt == 0:
+                    use_native = False
+                    logger.info("Falling back to JSON mode for the next retry.")
+                    continue
+
                 self.messages.append(
                     {
                         "role": "user",
                         "content": (
                             f"Your previous response was invalid ({last_error}). "
-                            "Reply with EXACTLY ONE tool call. If you don't need a "
-                            "domain tool, call the `respond` tool with your message "
-                            "in `content`. Do not output anything outside the tool call."
+                            "Reply with EXACTLY ONE JSON object of the form "
+                            '{"name": "<tool_name>", "arguments": {<args>}}. '
+                            "If you just want to talk to the user, use "
+                            '{"name": "respond", "arguments": {"content": "<message>"}}. '
+                            "No prose, no markdown, no code fences."
                         ),
                     }
                 )
+
+        logger.error(
+            "Giving up after %d attempts — returning safety-net respond. Last error: %s",
+            self.max_retries + 1,
+            last_error,
+        )
 
         # Final safety net so the run never crashes.
         return {
