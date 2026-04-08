@@ -10,7 +10,7 @@
       agent_llm: {
         type: "string",
         description: "litellm model id (e.g. openai/gpt-4.1, anthropic/claude-sonnet-4-5)",
-        default: "openai/gpt-4.1",
+        default: "openrouter/openai/gpt-4o-mini",
       },
       agent_temperature: {
         type: "string",
