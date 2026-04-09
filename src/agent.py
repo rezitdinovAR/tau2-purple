@@ -65,6 +65,21 @@ logger = logging.getLogger("tau2_purple_agent")
 
 ADVANCED_SYSTEM_PROMPT = """You are an elite customer-service agent for an airline. You handle real customer requests using internal tools. The DOMAIN POLICY at the bottom of this prompt is the law — you MUST follow it literally. You are evaluated on whether each task is completed CORRECTLY according to policy, not on how friendly you sound. A single policy violation, a wrong tool argument, an unconfirmed irreversible action, or an unjustified human transfer FAILS the entire task.
 
+# 🚨 SYSTEM-ENFORCED HARD RULES (these are checked in code; violations are auto-rejected)
+
+The runtime intercepts every tool call you produce and rejects calls that break any of the rules below. A rejection wastes a turn and sends you a directive correction. Internalize these rules and you will never see a rejection:
+
+1. **NEVER call `transfer_to_human_agents` as the first/second action.** You MUST first try domain tools (`get_user_details`, `get_reservation_details`, `send_certificate`, `update_reservation_*`, etc.) to actually solve the problem. The runtime rejects transfers that happen before you have done at least 2 substantive (non-respond, non-transfer) tool calls. The correct first move on ANY complaint is `respond` to ask for the user's ID, then `get_user_details`.
+2. **NEVER call `transfer_to_human_agents` if the user said "don't transfer me" / "no human" / "stay on the line".** The runtime rejects this absolutely for the rest of the conversation.
+3. **NEVER call `transfer_to_human_agents` on a compensation pushback** ("not enough", "I want more") unless you have already called `send_certificate` AND raised the offer at least once via a follow-up `respond`. The runtime rejects this.
+4. **NEVER call a state-changing tool on a `reservation_id` the user never typed.** The runtime extracts the 6-character reservation IDs from every user message and rejects `cancel_reservation` / `update_reservation_*` on any other ID. If you are unsure which reservation the user meant, call `respond` and ask — do NOT guess from `get_user_details` results.
+5. **NEVER call `book_reservation` without a recent `search_direct_flight` / `search_onestop_flight` call** (within the last ~8 actions) with the exact flight/date you intend to book. The runtime rejects speculative bookings. Always search → verify `available_seats[<cabin>] >= passenger_count` → only then book.
+6. **NEVER call any state-changing tool without first sending a `respond` that ends in a confirmation question** ("Shall I proceed?", "Is that correct?", "Would you like me to...?"). The runtime checks the most recent assistant `respond` for a confirmation phrase and a `?`. Always: summarize → ask → wait for yes → execute.
+7. **NEVER repeat a state-changing tool call with identical arguments** — the runtime rejects exact duplicates because the result is deterministic and won't change.
+8. **NEVER pass placeholder values** like `"user_id"`, `"<reservation_id>"`, `"..."` — the runtime rejects these. Use actual values from user messages or prior tool results.
+
+If a turn is rejected, READ the rejection message carefully. It tells you exactly what to fix.
+
 # How a turn works
 
 Each turn you receive either a user message or a tool result. You respond with EXACTLY ONE tool call:
@@ -209,19 +224,22 @@ Every tool argument must come from one of:
 
 NEVER make up: prices, dates, flight numbers, IDs, member numbers, payment method IDs, fare classes, baggage allowances, fees, seat counts, or names. If you don't have the value, ASK the user via `respond` or LOOK IT UP with the appropriate tool.
 
-## Rule 8 — STAY ON THE ORIGINAL TASK; resume after any side request
+## Rule 8 — STAY ON THE ORIGINAL TASK; DEFER side requests until the primary task is done
 
-The user's FIRST request in the conversation is the PRIMARY TASK. You are evaluated on whether the PRIMARY TASK gets completed end-to-end. If the user introduces a side request mid-conversation (a complaint, a question, an unrelated ask), handle the side request, BUT the moment it is resolved you MUST explicitly return to the primary task with a respond like:
+The user's FIRST request in the conversation is the PRIMARY TASK. You are evaluated on whether the PRIMARY TASK gets completed end-to-end. A primary task is "complete" only when the corresponding state-changing tool has been called (`book_reservation`, `cancel_reservation`, `update_reservation_*`) AND you've sent a final closing `respond` confirming the result.
 
-> "Now back to your booking — would you like me to proceed with the SFO → JFK itinerary I found earlier, or look at different options?"
+If the user introduces a side request mid-conversation BEFORE the primary task is complete (a complaint, a question, an unrelated ask), the correct move is to **acknowledge briefly and DEFER** until the primary task is done:
 
-A primary task is "complete" only when the corresponding state-changing tool has been called (`book_reservation`, `cancel_reservation`, `update_reservation_*`, `send_certificate`) AND you've sent a final closing `respond` confirming the result. A primary task is NOT complete after just searching, finding options, and answering a side question — you still owe the user the booking/cancellation/update.
+> "I'd love to help with that — let me first finish booking your SFO → JFK flight, then we can absolutely look at the delay compensation. To confirm, shall I proceed with HAT084 + HAT201 at $312?"
+
+Why defer instead of context-switch? Because after handling the side request, the model is statistically very likely to forget to come back to the primary task — and an unfinished primary task is an instant fail. Defer first. Side requests only get handled inline if the primary task is already 100% closed.
 
 Practical rules:
-- After every side request you handle, your NEXT `respond` must reference the primary task and offer to continue.
-- Do NOT call `transfer_to_human_agents` when there is an unfinished primary task — finish it first.
+- If a side request appears while the primary task is unfinished → acknowledge in ONE sentence and steer back: "I'll definitely help with [side request], but let me first complete [primary task] — shall I proceed?"
+- Do NOT call `send_certificate` or any other side-request tool while a primary task is unfinished — close the primary task first.
+- Do NOT call `transfer_to_human_agents` while a primary task is unfinished — finish it first.
 - Do NOT close the conversation ("Anything else?") until the primary task is fully done.
-- If the side request itself involves an irreversible action (e.g. issuing a certificate for a delay), confirm it, do it, then return to the primary task in the same `respond` that confirms completion of the side request: "I've sent you a $100 certificate for the delay. Now, shall I proceed with booking that connecting flight on June 12?"
+- After the primary task is fully complete, THEN handle the side request properly.
 
 ## Rule 9 — Disputed user data: document, OFFER A GOODWILL ACTION, continue
 
@@ -756,6 +774,150 @@ def _is_read_only_tool(name: str) -> bool:
     return False
 
 
+# ----------------------------------------------------------------------------
+# State-changing tool classification + per-call hard guards
+# ----------------------------------------------------------------------------
+#
+# These guards exist because gpt-4o-mini does not reliably follow long
+# system-prompt rules. Whenever the model produces a state-changing call that
+# violates a critical rule (premature transfer, no confirmation, wrong ID,
+# booking without a search), we reject it server-side and force a retry with
+# directive feedback.
+
+# Tools that mutate state. Loop detection and confirmation guards apply to
+# these. Anything not in this set is treated as read-only / informational.
+STATE_CHANGING_TOOL_PREFIXES = (
+    "cancel_",
+    "book_",
+    "update_",
+    "modify_",
+    "create_",
+    "delete_",
+    "send_",
+    "issue_",
+    "transfer_",
+    "refund_",
+    "charge_",
+)
+STATE_CHANGING_TOOL_NAMES = frozenset({
+    "transfer_to_human_agents",
+})
+
+
+def _is_state_changing_tool(name: str) -> bool:
+    if not name:
+        return False
+    name_lc = name.lower()
+    if name_lc in STATE_CHANGING_TOOL_NAMES:
+        return True
+    for prefix in STATE_CHANGING_TOOL_PREFIXES:
+        if name_lc.startswith(prefix):
+            return True
+    return False
+
+
+# Reservation IDs in this benchmark are 6-character uppercase alphanumeric
+# strings (e.g. EHGLP3, XEHM4B, M20IZO). The all-letter form is also
+# common. Match both, but reject obvious airport codes (3 letters).
+RESERVATION_ID_RE = re.compile(r"\b([A-Z0-9]{6})\b")
+# Common 6-letter words that the regex would otherwise pick up. Add as needed.
+_RESERVATION_ID_BLOCKLIST = frozenset({
+    "ECONOMY", "BUSINESS", "REFUND", "CANCEL", "CHANGE", "UPDATE", "BOOKED",
+    "CANCEL", "FLIGHT", "TICKET", "PERSON", "ADULTS", "BAGGAG", "PLEASE",
+    "CONFIRM", "STATUS", "SILVER", "GOLDEN", "PROFIL", "RECORD", "POLICY",
+    "AIRLIN", "SEARCH", "RESULT", "REASON", "ANSWER", "OPTION", "TRAVEL",
+    "RETURN", "DIRECT", "NONSTO", "TICKET", "CREDIT", "DEBITT",
+})
+
+
+def _extract_reservation_ids_from_text(text: str) -> set[str]:
+    """Pull 6-char uppercase reservation-id-shaped tokens from a chunk of text."""
+    if not text:
+        return set()
+    out: set[str] = set()
+    for match in RESERVATION_ID_RE.finditer(text):
+        token = match.group(1)
+        if token in _RESERVATION_ID_BLOCKLIST:
+            continue
+        # Skip pure-alpha tokens that are common English words. We can't catch
+        # them all, but we keep mixed alphanumeric ones (the most common ID
+        # shape) and any 6-char strings containing at least one digit.
+        if token.isalpha() and token.upper() == token and len(token) == 6:
+            # Allow 6-letter alpha IDs only if they look ID-like (mixed
+            # consonant/vowel pattern with no obvious word). Let them pass; the
+            # confirmation guard will still require the user to have echoed it.
+            pass
+        out.add(token)
+    return out
+
+
+# A few simple "I don't want a transfer" phrasings the user might use.
+NO_TRANSFER_PHRASES = (
+    "don't transfer",
+    "do not transfer",
+    "dont transfer",
+    "no transfer",
+    "without transferring",
+    "without a transfer",
+    "without escalating",
+    "don't escalate",
+    "do not escalate",
+    "stay on the line",
+    "no human agent",
+    "no human",
+    "without sending me to a human",
+)
+
+
+def _user_said_no_transfer(messages: list[dict[str, Any]]) -> bool:
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            continue
+        lc = content.lower()
+        for phrase in NO_TRANSFER_PHRASES:
+            if phrase in lc:
+                return True
+    return False
+
+
+# Phrases that look like a confirmation question in an assistant `respond`.
+CONFIRMATION_HINTS = (
+    "shall i proceed",
+    "shall i go ahead",
+    "shall i",
+    "should i proceed",
+    "should i go ahead",
+    "should i",
+    "do you want me to",
+    "do you confirm",
+    "ok to proceed",
+    "okay to proceed",
+    "is that correct",
+    "is that right",
+    "is this correct",
+    "is this right",
+    "please confirm",
+    "to confirm",
+    "just to confirm",
+    "can you confirm",
+    "would you like me to",
+    "shall we proceed",
+    "ready to proceed",
+)
+
+
+def _looks_like_confirmation_question(text: str) -> bool:
+    if not text:
+        return False
+    lc = text.lower()
+    if "?" not in lc:
+        return False
+    return any(hint in lc for hint in CONFIRMATION_HINTS)
+
+
 class ActionValidationError(ValueError):
     """The model produced a syntactically valid call that fails our semantic checks
     (placeholder argument or duplicate of a recent call)."""
@@ -971,6 +1133,204 @@ class Agent:
                 break
         return False
 
+    # ----- Conversation introspection helpers --------------------------------
+
+    def _iter_assistant_actions(self):
+        """Yield parsed assistant tool actions in chronological order."""
+        for msg in self.messages:
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                continue
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and "name" in parsed:
+                yield parsed
+
+    def _last_assistant_respond_text(self) -> str:
+        """Return the content of the most recent assistant `respond` call."""
+        for msg in reversed(self.messages):
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                continue
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and parsed.get("name") == "respond":
+                args = parsed.get("arguments") or {}
+                text = args.get("content", "") if isinstance(args, dict) else ""
+                return text if isinstance(text, str) else ""
+        return ""
+
+    def _count_state_changing_calls(self) -> int:
+        return sum(
+            1 for a in self._iter_assistant_actions()
+            if _is_state_changing_tool(a.get("name", ""))
+        )
+
+    def _count_send_certificate_calls(self) -> int:
+        return sum(
+            1 for a in self._iter_assistant_actions()
+            if (a.get("name") or "").lower() == "send_certificate"
+        )
+
+    def _has_recent_search(self, lookback: int = 6) -> bool:
+        """True if any of the last `lookback` assistant actions was a search/get tool."""
+        actions = list(self._iter_assistant_actions())
+        for a in actions[-lookback:]:
+            name = (a.get("name") or "").lower()
+            if name.startswith("search_") or name.startswith("get_"):
+                return True
+        return False
+
+    def _user_mentioned_reservation_ids(self) -> set[str]:
+        """All 6-char uppercase tokens the user has typed in any user message."""
+        ids: set[str] = set()
+        for msg in self.messages:
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                ids |= _extract_reservation_ids_from_text(content)
+        return ids
+
+    def _ids_seen_in_tool_results(self) -> set[str]:
+        """Reservation-id-shaped tokens that appear inside tool result chunks
+        the model has already seen (these come back to us as user-role messages
+        in our flat message log)."""
+        ids: set[str] = set()
+        for msg in self.messages:
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                continue
+            # Tool results are typically JSON-shaped or contain key:value lines.
+            # We pull every 6-char uppercase token; this is a superset that's
+            # safe because we union it with the explicit-mention set anyway.
+            ids |= _extract_reservation_ids_from_text(content)
+        return ids
+
+    # ----- Hard semantic guards on the chosen action -------------------------
+
+    def _validate_action(self, action: dict[str, Any]) -> str | None:
+        """Return an error message if the action violates a critical rule, else None.
+
+        These guards exist because gpt-4o-mini does not reliably follow long
+        prompt rules. We catch the worst regressions in code instead.
+        """
+        name = (action.get("name") or "").lower()
+        args = action.get("arguments") or {}
+        if not isinstance(args, dict):
+            args = {}
+
+        # ---- Guard 1: Never transfer when the user said not to ----
+        if name == "transfer_to_human_agents":
+            if _user_said_no_transfer(self.messages):
+                return (
+                    "REJECTED: the user explicitly told you NOT to transfer them to a human earlier "
+                    "in this conversation. You must NEVER call `transfer_to_human_agents` for the rest of "
+                    "this conversation. Instead, call `respond` to keep helping with what's possible — "
+                    "offer alternatives, a goodwill certificate, a refund/change, or politely close out."
+                )
+
+            # ---- Guard 2: Never transfer as the FIRST substantive action ----
+            # If we haven't even attempted any tool work (or only done lookups),
+            # transferring on first move is an instant fail of the eval task.
+            substantive_actions = [
+                a for a in self._iter_assistant_actions()
+                if (a.get("name") or "").lower() not in (
+                    "respond", "transfer_to_human_agents",
+                )
+            ]
+            if len(substantive_actions) < 2:
+                return (
+                    "REJECTED: you are about to transfer to a human without first attempting any "
+                    "substantive resolution. You have not yet looked up the user's data, searched for "
+                    "alternatives, or offered any concrete remedy. Compensation/cancellation/insurance/"
+                    "status/baggage requests must be HANDLED with the appropriate domain tools "
+                    "(`send_certificate`, `get_user_details`, `get_reservation_details`, `update_reservation_*`, "
+                    "etc.) BEFORE you ever consider transferring. Call `respond` and ask for the user's ID "
+                    "(or look up details if you already have it) to start solving the problem."
+                )
+
+            # ---- Guard 3: On compensation negotiation, must raise the offer first ----
+            cert_calls = self._count_send_certificate_calls()
+            last_user = ""
+            for m in reversed(self.messages):
+                if m.get("role") == "user":
+                    c = m.get("content", "")
+                    if isinstance(c, str):
+                        last_user = c.lower()
+                    break
+            pushback_signals = (
+                "not enough", "isn't enough", "is not enough", "more compensation",
+                "more than that", "want more", "is too low", "too little",
+                "i lost more", "doesn't cover", "not sufficient", "insufficient",
+            )
+            if cert_calls >= 1 and any(p in last_user for p in pushback_signals):
+                return (
+                    "REJECTED: the user pushed back on the compensation amount but you have not raised "
+                    "the offer yet. You MUST first call `respond` to propose a higher certificate amount "
+                    "(within the policy band — typically up to ~$400 for serious business-class disruptions). "
+                    "Only after at least ONE upward adjustment, and only if the user still refuses, may "
+                    "you consider any further escalation. Even then, prefer continuing to help over "
+                    "transferring — `transfer_to_human_agents` is almost never the right move."
+                )
+
+        # ---- Guard 4: State-changing calls on a reservation_id the user never mentioned ----
+        if _is_state_changing_tool(name) and name != "transfer_to_human_agents":
+            target_rid = None
+            for key in ("reservation_id", "reservationId", "id"):
+                if isinstance(args.get(key), str):
+                    target_rid = args[key]
+                    break
+            if target_rid and re.fullmatch(r"[A-Z0-9]{6}", target_rid):
+                user_mentioned = self._user_mentioned_reservation_ids()
+                if target_rid not in user_mentioned:
+                    return (
+                        f"REJECTED: you are about to call `{name}` on reservation_id={target_rid!r}, "
+                        "but the USER has never mentioned that reservation in this conversation. "
+                        "You may ONLY perform state-changing actions on reservation IDs the user has "
+                        "explicitly named. If you intended to act on a different reservation, re-read the "
+                        "user's request and use the ID THEY actually wrote. If you are not sure which "
+                        "reservation they meant, call `respond` and ask them to confirm the ID."
+                    )
+
+        # ---- Guard 5: book_reservation requires a recent search ----
+        if name in ("book_reservation", "book_flight"):
+            if not self._has_recent_search(lookback=8):
+                return (
+                    "REJECTED: you are about to call `book_reservation` without having recently called "
+                    "`search_direct_flight` (or `search_onestop_flight`) to verify that the requested "
+                    "flight has enough seats and the price you intend to charge. Always search first, "
+                    "verify `available_seats[<cabin>] >= passenger_count`, compute the price, and only "
+                    "then book. Call the appropriate search tool now."
+                )
+
+        # ---- Guard 6: state-changing calls require a confirmation question right before ----
+        if (
+            _is_state_changing_tool(name)
+            and name not in ("transfer_to_human_agents",)
+        ):
+            last_resp = self._last_assistant_respond_text()
+            if not _looks_like_confirmation_question(last_resp):
+                return (
+                    f"REJECTED: you are about to call `{name}` without first asking the user to confirm. "
+                    "Before any irreversible/state-changing action you MUST call `respond` with a brief "
+                    "summary including the key details (reservation IDs, amounts, dates, flights, cabin, "
+                    "payment method) and end with an explicit question like 'Shall I proceed?' — then WAIT "
+                    "for the user to say yes. Call `respond` now with that confirmation."
+                )
+
+        return None
+
     def _get_next_action(self) -> dict[str, Any]:
         last_error: str | None = None
         use_native = bool(self.tools)
@@ -1037,6 +1397,10 @@ class Agent:
                         "  (d) call `respond` to acknowledge that the request can't be fulfilled and propose concrete next steps.\n"
                         "Do NOT call `transfer_to_human_agents` as the way out — solve the problem or close the loop with the user."
                     )
+
+                guard_error = self._validate_action(action)
+                if guard_error is not None:
+                    raise ActionValidationError(guard_error)
 
                 return action
 
