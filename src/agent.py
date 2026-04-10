@@ -1031,7 +1031,7 @@ class Agent:
         else:
             self.messages.append({"role": "user", "content": input_text})
 
-        action = self._get_next_action()
+        action = await self._get_next_action()
 
         # Store the assistant turn as plain JSON content so we never get tangled
         # up in OpenAI's tool_call/tool_message round-trip rules.
@@ -1331,7 +1331,7 @@ class Agent:
 
         return None
 
-    def _get_next_action(self) -> dict[str, Any]:
+    async def _get_next_action(self) -> dict[str, Any]:
         last_error: str | None = None
         use_native = bool(self.tools)
 
@@ -1349,7 +1349,7 @@ class Agent:
                 else:
                     kwargs["response_format"] = {"type": "json_object"}
 
-                completion = litellm.completion(**kwargs)
+                completion = await litellm.acompletion(**kwargs)
                 msg = completion.choices[0].message
 
                 # 1) Native tool-call path.
